@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import uuid
 import argparse
 import logging
 import subprocess
@@ -18,10 +19,14 @@ logging.basicConfig(
 # Optional imports for scraping, so Git init can run even without them
 try:
     import requests
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, NavigableString
+    import docx
+    from docx.shared import Inches
 except ImportError:
     requests = None
     BeautifulSoup = None
+    docx = None
+    NavigableString = None
 
 def init_git_repo(base_dir: Path):
     """Initializes Git repository if it doesn't exist, creates boilerplate files and first commit."""
@@ -52,7 +57,7 @@ def init_git_repo(base_dir: Path):
 
     requirements_path = base_dir / 'requirements.txt'
     if not requirements_path.exists():
-        requirements_path.write_text("requests\nbeautifulsoup4\n", encoding='utf-8')
+        requirements_path.write_text("requests\nbeautifulsoup4\npython-docx\nyt-dlp\n", encoding='utf-8')
         logging.info("Created requirements.txt")
 
     # Create empty data folder just in case (ignored by git, but good for structure)
@@ -99,35 +104,98 @@ def get_session(base_dir: Path):
         
     return session
 
-def process_block(block, course_dir: Path, lesson_title: str, block_idx: int):
-    """Processes a single content block, extracting text and video hashes."""
+def process_element(elem, doc, session, lesson_dir):
+    """Recursively processes elements to preserve order of text and images."""
+    if isinstance(elem, NavigableString):
+        text = str(elem).strip()
+        if text:
+            doc.add_paragraph(text)
+        return
+
+    if elem.name in ['script', 'style', 'iframe']:
+        return
+
+    if elem.name == 'img':
+        src = elem.get('src')
+        if src:
+            if src.startswith('//'):
+                src = 'https:' + src
+            elif src.startswith('/'):
+                src = 'https://niifittech.ru' + src
+            
+            try:
+                r = session.get(src, stream=True, timeout=15)
+                r.raise_for_status()
+                
+                temp_img = lesson_dir / f"temp_{uuid.uuid4().hex}.jpg"
+                with open(temp_img, 'wb') as f:
+                    for chunk in r.iter_content(1024):
+                        f.write(chunk)
+                
+                try:
+                    doc.add_picture(str(temp_img), width=Inches(6))
+                except Exception as pic_err:
+                    logging.error(f"Failed to insert image to doc: {pic_err}")
+                
+                if temp_img.exists():
+                    os.remove(temp_img)
+            except Exception as e:
+                logging.error(f"Failed to download image {src}: {e}")
+        return
+
+    if elem.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+        doc.add_heading(elem.get_text(strip=True), level=int(elem.name[1]))
+        return
+
+    # If it's a structural element containing text and NO images, just grab text
+    if elem.name in ['p', 'li', 'div', 'span', 'strong', 'b', 'i', 'em']:
+        if not elem.find('img'):
+            text = elem.get_text(strip=True)
+            if text:
+                if elem.name == 'li':
+                    doc.add_paragraph(text, style='List Bullet')
+                else:
+                    doc.add_paragraph(text)
+            return
+
+    # Process children recursively for layout preservation
+    if hasattr(elem, 'children'):
+        for child in elem.children:
+            process_element(child, doc, session, lesson_dir)
+
+def process_block(block, course_dir: Path, lesson_title: str, block_idx: int, session):
+    """Processes a single content block, extracting text, images and downloading videos."""
+    lesson_dir = course_dir / clean_filename(lesson_title)
+    lesson_dir.mkdir(parents=True, exist_ok=True)
     
-    # Attempt to find a sub-title inside the block, if any
+    doc_path = lesson_dir / "content.docx"
+    if doc_path.exists():
+        try:
+            doc = docx.Document(doc_path)
+        except Exception:
+            # Recreate if corrupted or not a valid docx
+            doc = docx.Document()
+            doc.add_heading(lesson_title, level=1)
+    else:
+        doc = docx.Document()
+        doc.add_heading(lesson_title, level=1)
+        
     title_elem = block.find(['h1', 'h2', 'h3', 'h4', 'strong', 'b'])
     if title_elem and title_elem.get_text(strip=True):
         block_title = title_elem.get_text(strip=True)
     else:
         block_title = f"Block_{block_idx}"
         
-    lesson_dir = course_dir / clean_filename(lesson_title)
-    lesson_dir.mkdir(parents=True, exist_ok=True)
+    doc.add_heading(block_title, level=2)
     
-    # Extract text content
-    for tag in block(["script", "style"]):
-        tag.decompose()
+    # Process contents preserving order
+    for child in block.children:
+        process_element(child, doc, session, lesson_dir)
         
-    text_content = block.get_text(separator='\n\n', strip=True)
-    if text_content:
-        md_file = lesson_dir / f"{clean_filename(block_title)}.md"
-        # Append if exists (multiple blocks per lesson)
-        mode = 'a' if md_file.exists() else 'w'
-        with open(md_file, mode, encoding='utf-8') as f:
-            if mode == 'w':
-                f.write(f"# {lesson_title}\n\n")
-            f.write(f"## {block_title}\n\n{text_content}\n\n")
-        logging.info(f"Saved text content -> {md_file.name}")
+    doc.save(doc_path)
+    logging.info(f"Saved text and images -> {doc_path.name}")
 
-    # Extract video iframes or hashes
+    # Extract videos
     videos = block.find_all(lambda tag: tag.name == 'iframe' or tag.has_attr('data-video-hash'))
     video_items = []
     
@@ -138,23 +206,22 @@ def process_block(block, course_dir: Path, lesson_title: str, block_idx: int):
             video_items.append(v['data-video-hash'])
 
     if video_items:
-        links_file = lesson_dir / "video_links.txt"
-        mode = 'a' if links_file.exists() else 'w'
-        with open(links_file, mode, encoding='utf-8') as f:
-            f.write("\n".join(video_items) + "\n")
-        logging.info(f"Saved {len(video_items)} video links -> {links_file.name}")
-        
-        # Generate yt-dlp commands
-        ytdlp_log = lesson_dir / "yt-dlp_commands.log"
-        cmds = []
-        for item in video_items:
+        # Download videos automatically using yt-dlp
+        for idx, item in enumerate(video_items, start=1):
             target = item if "://" in item else f"https://player.getcourse.ru/video/hash/{item}"
-            cmd = f"yt-dlp --cookies cookies.txt -o \"%(title)s.%(ext)s\" \"{target}\""
-            cmds.append(cmd)
+            logging.info(f"Downloading video {idx}/{len(video_items)} in {lesson_title}...")
             
-        mode = 'a' if ytdlp_log.exists() else 'w'
-        with open(ytdlp_log, mode, encoding='utf-8') as f:
-            f.write("\n".join(cmds) + "\n")
+            out_tmpl = str(lesson_dir / f"%(title)s_%(id)s.%(ext)s")
+            cmd = ["yt-dlp", "--cookies", "cookies.txt", "-o", out_tmpl, target]
+            
+            try:
+                subprocess.run(cmd, cwd=Path(__file__).parent, check=True)
+                logging.info(f"Successfully downloaded video: {target}")
+            except subprocess.CalledProcessError as e:
+                logging.error(f"Failed to download video {target}. yt-dlp returned error. Moving on...")
+            except FileNotFoundError:
+                logging.error("yt-dlp is not installed! Cannot download video. Please install it.")
+
 
 def process_lesson(url: str, session, course_dir: Path, title: str):
     """Fetches a lesson page and extracts its content blocks."""
@@ -167,14 +234,14 @@ def process_lesson(url: str, session, course_dir: Path, title: str):
         return
 
     soup = BeautifulSoup(response.text, 'html.parser')
-    blocks = soup.select('.lite-block-live-wrapper, .v-spacing') # Expanded selectors
+    blocks = soup.select('.lite-block-live-wrapper, .v-spacing') 
     
     if not blocks:
         logging.warning(f"No content blocks found in lesson: {title}")
         return
 
     for idx, block in enumerate(blocks, start=1):
-        process_block(block, course_dir, title, idx)
+        process_block(block, course_dir, title, idx, session)
         
     time.sleep(1) # Polite delay between lessons
 
@@ -190,7 +257,6 @@ def crawl_course(url: str, session, data_dir: Path):
 
     soup = BeautifulSoup(response.text, 'html.parser')
     
-    # Try to find a course title
     title_elem = soup.find('h1')
     course_title = title_elem.get_text(strip=True) if title_elem else "Course"
     course_dir = data_dir / clean_filename(course_title)
@@ -198,27 +264,21 @@ def crawl_course(url: str, session, data_dir: Path):
     
     logging.info(f"Course directory created: {course_dir.name}")
     
-    # Find all links to lessons. Usually contain /lesson/view/id/
-    # Sometimes it's /teach/control/lesson/view/id/
     lesson_links = soup.find_all('a', href=lambda href: href and '/lesson/view/id/' in href)
     
     if not lesson_links:
         logging.warning("No lesson links found. Is this a course stream page? Ensure cookies are valid.")
-        # If it's just a single lesson, fallback to parsing it directly
         process_lesson(url, session, data_dir, "Single_Lesson")
         return
 
-    # Deduplicate lesson links while preserving order
     seen = set()
     lessons = []
     for a in lesson_links:
         href = a['href']
         if href not in seen:
             seen.add(href)
-            # Find a title for the lesson
             title = a.get_text(strip=True)
             if not title:
-                # sometimes title is in an adjacent element
                 parent = a.find_parent('div', class_='stream-title') or a.find_parent('td')
                 if parent:
                     title = parent.get_text(strip=True)
@@ -237,7 +297,7 @@ def crawl_course(url: str, session, data_dir: Path):
 
 def scrape(url_or_path: str):
     """Main scraping orchestrator."""
-    if requests is None or BeautifulSoup is None:
+    if requests is None or BeautifulSoup is None or docx is None:
         logging.error("Missing dependencies. Please run: pip install -r requirements.txt")
         sys.exit(1)
 
@@ -248,10 +308,8 @@ def scrape(url_or_path: str):
     session = get_session(base_dir)
     
     if url_or_path.startswith("http://") or url_or_path.startswith("https://"):
-        # We will assume it's a stream URL and try to crawl it
         crawl_course(url_or_path, session, data_dir)
     else:
-        # Local file parsing fallback
         path = Path(url_or_path)
         if not path.exists():
             logging.error(f"File not found: {path}")
@@ -261,7 +319,7 @@ def scrape(url_or_path: str):
         soup = BeautifulSoup(html_content, 'html.parser')
         blocks = soup.select('.lite-block-live-wrapper, .v-spacing')
         for idx, block in enumerate(blocks, start=1):
-            process_block(block, data_dir, "Local_File", idx)
+            process_block(block, data_dir, "Local_File", idx, session)
 
 def main():
     parser = argparse.ArgumentParser(description="GetCourse clean and scalable scraper engine.")
@@ -270,10 +328,8 @@ def main():
 
     base_dir = Path(__file__).parent.resolve()
     
-    # 1. Initialize git repo if not exists
     init_git_repo(base_dir)
 
-    # 2. Run scraper if URL is provided
     if args.url:
         scrape(args.url)
     else:
