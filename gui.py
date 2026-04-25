@@ -142,12 +142,12 @@ class MainWindow(QMainWindow):
             QLabel { font-family: 'Segoe UI', Arial; font-size: 14px; color: #202124; }
             QLineEdit { 
                 padding: 10px; border: 1px solid #dadce0; border-radius: 6px; 
-                font-size: 14px; background: white;
+                font-size: 14px; background: white; color: #202124;
             }
             QLineEdit:focus { border: 2px solid #1a73e8; }
             QPushButton {
                 font-family: 'Segoe UI', Arial; font-weight: bold; font-size: 14px;
-                border-radius: 6px; padding: 10px 15px; cursor: pointer;
+                border-radius: 6px; padding: 10px 15px; cursor: pointer; color: #202124;
             }
             QTextEdit {
                 background-color: #282c34; color: #abb2bf; font-family: 'Consolas', monospace;
