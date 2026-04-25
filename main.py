@@ -102,6 +102,17 @@ def process_element(elem, doc, session, course_dir):
     if elem.name in ['script', 'style', 'iframe', 'video']:
         return
 
+    # Filter out user avatars and comment blocks
+    if hasattr(elem, 'get'):
+        classes = elem.get('class', [])
+        if isinstance(classes, list):
+            bad_classes = {'user-image', 'user-profile-image', 'answer-comment', 'feedback-modal', 'user-avatar', 'comment-form', 'comments-block', 'lt-form'}
+            if any(c in bad_classes for c in classes):
+                return
+        elif isinstance(classes, str):
+            if any(c in classes for c in ['user-image', 'user-profile-image', 'answer-comment', 'feedback-modal', 'user-avatar', 'comment-form', 'comments-block', 'lt-form']):
+                return
+
     if elem.name == 'img':
         src = elem.get('src')
         if src:
