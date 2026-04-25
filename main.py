@@ -10,6 +10,31 @@ import http.cookiejar
 from urllib.parse import urljoin
 from pathlib import Path
 
+# Global state for GUI control
+ABORT_DOWNLOAD = False
+PAUSE_DOWNLOAD = False
+CURRENT_YTDLP_PID = None
+CREATED_FILES = []
+
+def check_pause_abort():
+    global ABORT_DOWNLOAD, PAUSE_DOWNLOAD
+    if ABORT_DOWNLOAD:
+        raise InterruptedError("Загрузка отменена пользователем.")
+    while PAUSE_DOWNLOAD:
+        if ABORT_DOWNLOAD:
+            raise InterruptedError("Загрузка отменена пользователем.")
+        time.sleep(0.5)
+
+def cleanup_session():
+    """Deletes all files created during the current run if aborted."""
+    for f in CREATED_FILES:
+        try:
+            if f.exists():
+                f.unlink()
+        except:
+            pass
+    CREATED_FILES.clear()
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -93,9 +118,13 @@ def get_session(base_dir: Path):
 
 def process_element(elem, doc, session, course_dir):
     """Recursively processes elements to preserve order of text and images, and avoids adding duplicate headings."""
+    check_pause_abort()
+    
     if isinstance(elem, NavigableString):
         text = str(elem).strip()
         if text:
+            if text.startswith('{"signature":') or text.startswith('{"object_type_id":'):
+                return
             doc.add_paragraph(text)
         return
 
@@ -106,12 +135,58 @@ def process_element(elem, doc, session, course_dir):
     if hasattr(elem, 'get'):
         classes = elem.get('class', [])
         if isinstance(classes, list):
-            bad_classes = {'user-image', 'user-profile-image', 'answer-comment', 'feedback-modal', 'user-avatar', 'comment-form', 'comments-block', 'lt-form'}
+            bad_classes = {'user-image', 'user-profile-image', 'answer-comment', 'feedback-modal', 'user-avatar', 'comment-form', 'comments-block', 'lt-form', 'form-group', 'lesson-answer-comment', 'user-related-data', 'vue-component', 'task-block'}
             if any(c in bad_classes for c in classes):
                 return
         elif isinstance(classes, str):
-            if any(c in classes for c in ['user-image', 'user-profile-image', 'answer-comment', 'feedback-modal', 'user-avatar', 'comment-form', 'comments-block', 'lt-form']):
+            if any(c in classes for c in ['user-image', 'user-profile-image', 'answer-comment', 'feedback-modal', 'user-avatar', 'comment-form', 'comments-block', 'lt-form', 'form-group', 'lesson-answer-comment', 'user-related-data', 'vue-component', 'task-block']):
                 return
+
+    # Handle file downloads from <a> tags (Word, PDF, etc.)
+    if elem.name == 'a':
+        href = elem.get('href')
+        if href and ('/fileservice/file/download' in href or href.endswith(('.pdf', '.doc', '.docx', '.xls', '.xlsx', '.zip', '.rar'))):
+            link_text = elem.get_text(strip=True)
+            if not link_text:
+                link_text = "Приложение"
+            
+            ext = ""
+            if "." in href.split("/")[-1]:
+                ext = "." + href.split("/")[-1].split(".")[-1].split("?")[0]
+            
+            if href.startswith('//'):
+                href = 'https:' + href
+            elif href.startswith('/'):
+                href = 'https://niifittech.ru' + href
+                
+            try:
+                logging.info(f"Скачивание прикрепленного файла: {link_text}")
+                r = session.get(href, stream=True, timeout=15)
+                r.raise_for_status()
+                
+                cd = r.headers.get('Content-Disposition', '')
+                if not ext and 'filename=' in cd:
+                    match = re.search(r'filename="?([^";]+)"?', cd)
+                    if match:
+                        server_filename = match.group(1)
+                        if '.' in server_filename:
+                            ext = '.' + server_filename.split('.')[-1]
+                
+                filename = clean_filename(link_text) + ext
+                file_path = course_dir / filename
+                
+                with open(file_path, 'wb') as f:
+                    for chunk in r.iter_content(8192):
+                        check_pause_abort()
+                        f.write(chunk)
+                CREATED_FILES.append(file_path)
+                
+                doc.add_paragraph(f"[Скачан файл: {file_path.name}]", style='Intense Quote')
+            except Exception as e:
+                logging.error(f"Failed to download attached file {href}: {e}")
+                
+            # Do not recurse into children of this <a> to skip the PDF/DOCX icon image
+            return
 
     if elem.name == 'img':
         src = elem.get('src')
@@ -209,6 +284,7 @@ def process_lesson(url: str, session, course_dir: Path, title: str):
         process_block(block, doc, session, course_dir)
         
     doc.save(doc_path)
+    CREATED_FILES.append(doc_path)
     logging.info(f"Saved text and images -> {doc_path.name}")
 
     # Extract videos from ALL blocks
@@ -241,16 +317,42 @@ def process_lesson(url: str, session, course_dir: Path, title: str):
             video_name = f"{clean_title}_{idx}" if len(video_items) > 1 else clean_title
             out_tmpl = str(course_dir / f"{video_name}.%(ext)s")
             
+            # Predict the final video file path assuming mp4
+            CREATED_FILES.append(course_dir / f"{video_name}.mp4")
+            
+            global CURRENT_YTDLP_PID
             cmd = ["yt-dlp", "--cookies", "cookies.txt", "--referer", "https://niifittech.ru/", "-o", out_tmpl, target]
             
             try:
-                subprocess.run(cmd, cwd=Path(__file__).parent, check=True)
-                logging.info(f"Successfully downloaded video for: {clean_title}")
-            except subprocess.CalledProcessError as e:
-                logging.error(f"Failed to download video. yt-dlp returned error. Moving on...")
+                proc = subprocess.Popen(cmd, cwd=Path(__file__).parent, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                CURRENT_YTDLP_PID = proc.pid
+                
+                for line in proc.stdout:
+                    check_pause_abort()
+                    # Pass the yt-dlp output to logger with a special prefix
+                    logging.info(f"YTDLP_OUT: {line.strip()}")
+                
+                proc.wait()
+                CURRENT_YTDLP_PID = None
+                
+                if proc.returncode == 0:
+                    logging.info(f"Successfully downloaded video for: {clean_title}")
+                else:
+                    logging.error(f"Failed to download video. yt-dlp returned error. Moving on...")
+            except InterruptedError as e:
+                if CURRENT_YTDLP_PID:
+                    try:
+                        import psutil
+                        psutil.Process(CURRENT_YTDLP_PID).kill()
+                    except:
+                        pass
+                CURRENT_YTDLP_PID = None
+                raise e
             except FileNotFoundError:
+                CURRENT_YTDLP_PID = None
                 logging.error("yt-dlp is not installed! Cannot download video. Please install it.")
         
+    check_pause_abort()
     time.sleep(1) # Polite delay between lessons
 
 def crawl_course(url: str, session, data_dir: Path, visited=None):
@@ -266,6 +368,7 @@ def crawl_course(url: str, session, data_dir: Path, visited=None):
 
     logging.info(f"Crawling course stream: {url}")
     try:
+        check_pause_abort()
         response = session.get(url, timeout=15)
         response.raise_for_status()
     except requests.RequestException as e:

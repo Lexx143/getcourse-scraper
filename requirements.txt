@@ -4,3 +4,4 @@ python-docx
 yt-dlp
 PyQt6
 PyQt6-WebEngine
+psutil
