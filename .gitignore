@@ -3,3 +3,6 @@ __pycache__/
 .env
 venv/
 *.pyc
+cookies.txt
+debug.html
+.DS_Store
